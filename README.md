@@ -2,7 +2,8 @@
 
 FastAPI 服务：接收 Intel HEX 文本，逐行校验（字节数 + 二补校验和），按地址组装固件映像，
 返回合并后的连续 Base64 段、段间空洞、入口地址与逐行诊断；并可针对一组命名内存区域
-做布局校验（覆盖率、data/entry 权限、区域占用率）。
+做布局校验（覆盖率、data/entry 权限、区域占用率）、整体重定位规划，或对比当前 flash
+内容与目标映像生成增量擦写计划。
 
 ## 快速启动（单条命令）
 
@@ -209,6 +210,85 @@ curl -s -X POST http://localhost:8000/api/v1/plan-relocation \
 - 省略 `max_abs_shift` 时仅受区域与 32 位地址空间约束；对没有任何段与入口
   的空映像，可行集无界，返回 `delta=0` 与空的 `feasible_ranges`。
 
+### `POST /api/v1/plan-flash-update`
+
+增量 flash 更新规划：复用同一 Intel HEX 解析器分别组装 `current_hex`（当前
+flash 内容）与 `target_hex`（目标映像），在 flash 窗口
+`[flash_start, flash_end)` 内逐擦除块比较，输出把当前内容更新为目标映像
+所需的 erase/write 操作序列。**任一映像中缺失的地址一律按 `0xFF`（擦除态）
+处理**；窗口外的数据不参与规划（会以 warning 提示被忽略的字节数）。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/plan-flash-update \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "current_hex": ":011000000FE0\n:01100400F0FB\n:00000001FF\n",
+    "target_hex": ":011000000FE0\n:011020000FC0\n:00000001FF\n",
+    "flash_start": 4096,
+    "flash_end": 4160,
+    "erase_block_size": 32,
+    "max_write_size": 16
+  }' | jq
+```
+
+参数与规划规则：
+
+- `erase_block_size`、`max_write_size` 必须为正整数；
+- `flash_start < flash_end`，且二者都必须按 `erase_block_size` 对齐
+  （窗口恰好容纳整数个擦除块）；
+- flash 单元只能把位由 1 编程为 0：块内任一字节出现 0→1 位翻转时，
+  **先擦除该块，再按目标映像重写块内所有非 `0xFF` 字节**；
+  否则仅写入发生变化的字节；
+- 待写数据合并为连续 run，按 `max_write_size` 切分，且任何 write
+  操作绝不跨越擦除块边界；
+- 任一 HEX 或参数无效时只返回 `diagnostics`（`source` 区分
+  `current`/`target`/`params`），`operations`/`blocks` 为空、`stats`
+  为 `null`，不生成计划。
+
+响应示例（同样恒为 200）：
+
+```json
+{
+  "ok": true,
+  "current_hex_ok": true,
+  "target_hex_ok": true,
+  "params_valid": true,
+  "error_count": 0,
+  "warning_count": 0,
+  "current_total_bytes": 2,
+  "target_total_bytes": 2,
+  "operations": [
+    {"op": "erase", "address": 4096, "size": 32, "data_base64": null},
+    {"op": "write", "address": 4096, "size": 1, "data_base64": "Dw=="},
+    {"op": "write", "address": 4128, "size": 1, "data_base64": "Dw=="}
+  ],
+  "blocks": [
+    {"index": 0, "start": 4096, "end": 4128, "erased": true, "write_bytes": 1},
+    {"index": 1, "start": 4128, "end": 4160, "erased": false, "write_bytes": 1}
+  ],
+  "stats": {
+    "block_count": 2, "affected_blocks": 2,
+    "erase_count": 1, "erased_bytes": 32,
+    "write_count": 2, "written_bytes": 2,
+    "changed_bytes": 2
+  },
+  "diagnostics": [ ... ]
+}
+```
+
+上例中：块 0 内 `0x1004` 处需由 `0xF0` 变为 `0xFF`（含 0→1 翻转），故先
+`erase` 整块，再重写块内目标映像的非 `0xFF` 字节（`0x1000` 处的 `0x0F`
+虽与当前值相同，但擦除后必须重写）；块 1 仅 `0xFF→0x0F`（1→0），直接写
+变化字节即可。
+
+- `operations[]`：按地址升序的 erase/write 操作；`write` 携带
+  `data_base64` 负载，`erase` 的 `size` 为整个擦除块。
+- `blocks[]`：计划触及的擦除块（窗口内序号、地址范围、是否擦除、
+  块内写入字节数）。
+- `stats`：擦写统计——窗口总块数、受影响块数、erase 次数与擦除字节数
+  （`erase_count * erase_block_size`）、write 次数与写入字节数，以及
+  窗口内 `current != target` 的差异字节数 `changed_bytes`。
+
 ## 解析规则
 
 - 每行必须形如 `:llaaaatt<data>cc`；校验 `ll`（字节数）与实际数据长度一致，
@@ -228,14 +308,16 @@ curl -s -X POST http://localhost:8000/api/v1/plan-relocation \
 
 ```
 app/
-  main.py        # FastAPI 应用与请求/响应模型
-  hex_parser.py  # Intel HEX 解析与映像组装（纯逻辑，可独立测试）
-  layout.py      # 内存布局校验（区域定义检查、段切分、占用统计，纯逻辑）
-  relocation.py  # 整体重定位规划（可行 delta 闭区间求交合并、选最小位移，纯逻辑）
+  main.py          # FastAPI 应用与请求/响应模型
+  hex_parser.py    # Intel HEX 解析与映像组装（纯逻辑，可独立测试）
+  layout.py        # 内存布局校验（区域定义检查、段切分、占用统计，纯逻辑）
+  relocation.py    # 整体重定位规划（可行 delta 闭区间求交合并、选最小位移，纯逻辑）
+  flash_update.py  # 增量 flash 更新规划（逐块比较、擦除判定、写 run 合并切分，纯逻辑）
 tests/
   test_hex_service.py       # 解析器与 assemble 接口
   test_validate_layout.py   # validate-layout 接口与布局逻辑
   test_plan_relocation.py   # plan-relocation 接口与重定位逻辑
+  test_plan_flash_update.py # plan-flash-update 接口与擦写规划逻辑
 Dockerfile
 docker-compose.yml
 requirements.txt       # 运行依赖

@@ -8,13 +8,19 @@ from fastapi import Body, FastAPI
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
+from .flash_update import (
+    FlashParams,
+    count_outside,
+    plan_flash_update,
+    validate_flash_params,
+)
 from .hex_parser import ParseResult, parse_intel_hex
 from .layout import Region, validate_layout
 from .relocation import plan_relocation
 
 app = FastAPI(
     title="Firmware Image Assembly Service",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Accepts Intel HEX text, validates every record (byte count and "
         "two's-complement checksum; record types 00/01/02/03/04/05), assembles "
@@ -22,8 +28,10 @@ app = FastAPI(
         "inter-segment gaps, the entry address and per-line diagnostics. "
         "The assembled image can also be validated against a set of named, "
         "non-overlapping memory regions (data/entry permissions, per-region "
-        "occupancy and utilization), or relocated as a whole by one integer "
-        "delta whose feasible range is computed against those regions."
+        "occupancy and utilization), relocated as a whole by one integer "
+        "delta whose feasible range is computed against those regions, or "
+        "diffed against the current flash contents to plan an incremental "
+        "erase/write update."
     ),
 )
 
@@ -249,6 +257,90 @@ class ValidateLayoutResponse(BaseModel):
     diagnostics: list[DiagnosticOut]
 
 
+class PlanFlashUpdateRequest(BaseModel):
+    current_hex: str = Field(..., description="Intel HEX text of the current flash contents")
+    target_hex: str = Field(..., description="Intel HEX text of the target firmware image")
+    flash_start: int = Field(..., description="Inclusive flash window start address")
+    flash_end: int = Field(..., description="Exclusive flash window end address")
+    erase_block_size: int = Field(
+        ..., description="Erase block size in bytes; both window edges must align to it"
+    )
+    max_write_size: int = Field(..., description="Maximum payload size of one write operation")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "current_hex": ":011000000FE0\n:01100400F0FB\n:00000001FF\n",
+                    "target_hex": ":011000000FE0\n:011020000FC0\n:00000001FF\n",
+                    "flash_start": 4096,
+                    "flash_end": 4160,
+                    "erase_block_size": 32,
+                    "max_write_size": 16,
+                }
+            ]
+        }
+    }
+
+
+class FlashDiagnosticOut(BaseModel):
+    source: str = Field(..., description="current | target | params")
+    line: int = Field(..., description="1-based line number; 0 marks a file/parameter-level issue")
+    status: str = Field(..., description="ok | warning | error")
+    record_type: str | None = None
+    address: int | None = Field(None, description="Absolute address the record refers to, if any")
+    byte_count: int | None = None
+    message: str
+
+
+class FlashOperationOut(BaseModel):
+    op: str = Field(..., description="erase | write")
+    address: int = Field(..., description="Absolute start address of the operation")
+    size: int = Field(..., description="Bytes affected (erase: whole block; write: payload size)")
+    data_base64: str | None = Field(None, description="Write payload, Base64-encoded; null for erase")
+
+
+class FlashBlockOut(BaseModel):
+    index: int = Field(..., description="Erase block index within the flash window")
+    start: int = Field(..., description="Inclusive block start address")
+    end: int = Field(..., description="Exclusive block end address")
+    erased: bool = Field(..., description="True when the block is erased before rewriting")
+    write_bytes: int = Field(..., description="Total bytes written inside this block")
+
+
+class FlashStatsOut(BaseModel):
+    block_count: int = Field(..., description="Total erase blocks in the flash window")
+    affected_blocks: int = Field(..., description="Blocks touched by at least one operation")
+    erase_count: int = Field(..., description="Number of erase operations")
+    erased_bytes: int = Field(..., description="erase_count * erase_block_size")
+    write_count: int = Field(..., description="Number of write operations")
+    written_bytes: int = Field(..., description="Total payload bytes written")
+    changed_bytes: int = Field(..., description="Bytes inside the window where current != target")
+
+
+class PlanFlashUpdateResponse(BaseModel):
+    ok: bool = Field(
+        ..., description="True when both HEX inputs and all parameters are valid and a plan was generated"
+    )
+    current_hex_ok: bool = Field(..., description="True when current_hex passed validation")
+    target_hex_ok: bool = Field(..., description="True when target_hex passed validation")
+    params_valid: bool = Field(..., description="True when the flash window and sizes are usable")
+    error_count: int
+    warning_count: int
+    current_total_bytes: int = Field(..., description="Data bytes assembled from current_hex")
+    target_total_bytes: int = Field(..., description="Data bytes assembled from target_hex")
+    operations: list[FlashOperationOut] = Field(
+        ..., description="Erase/write operations in address order; empty when no plan was generated"
+    )
+    blocks: list[FlashBlockOut] = Field(
+        ..., description="Erase blocks touched by the plan, in address order"
+    )
+    stats: FlashStatsOut | None = Field(
+        ..., description="Erase/write byte statistics; null when no plan was generated"
+    )
+    diagnostics: list[FlashDiagnosticOut]
+
+
 def _build_response(result: ParseResult) -> AssembleResponse:
     return AssembleResponse(
         ok=result.ok,
@@ -448,4 +540,106 @@ def plan_relocation_route(request: PlanRelocationRequest) -> PlanRelocationRespo
         violations=[],
         max_abs_shift=request.max_abs_shift,
         **parse_fields,
+    )
+
+
+@app.post("/api/v1/plan-flash-update", response_model=PlanFlashUpdateResponse, tags=["flash"])
+def plan_flash_update_route(request: PlanFlashUpdateRequest) -> PlanFlashUpdateResponse:
+    """Plan an incremental flash update from two Intel HEX images.
+
+    Both HEX texts are parsed with the shared Intel HEX parser; addresses
+    absent from an image read as ``0xFF``. The flash window
+    ``[flash_start, flash_end)`` must hold a whole number of erase blocks
+    (both edges aligned to ``erase_block_size``). Each block is compared
+    byte by byte: when any bit must flip 0 -> 1 the block is erased and
+    every non-``0xFF`` target byte in it is rewritten, otherwise only the
+    differing bytes are written. Pending writes merge into contiguous
+    runs split at ``max_write_size`` and never crossing an erase-block
+    boundary. When either HEX or any parameter is invalid, only
+    diagnostics are returned and no plan is generated.
+    """
+    current = parse_intel_hex(request.current_hex)
+    target = parse_intel_hex(request.target_hex)
+
+    diagnostics = [
+        FlashDiagnosticOut(source="current", **vars(d)) for d in current.diagnostics
+    ] + [FlashDiagnosticOut(source="target", **vars(d)) for d in target.diagnostics]
+
+    params = FlashParams(
+        flash_start=request.flash_start,
+        flash_end=request.flash_end,
+        erase_block_size=request.erase_block_size,
+        max_write_size=request.max_write_size,
+    )
+    param_errors = validate_flash_params(params)
+    diagnostics += [
+        FlashDiagnosticOut(source="params", line=0, status="error", message=message)
+        for message in param_errors
+    ]
+
+    parse_fields = dict(
+        current_hex_ok=current.ok,
+        target_hex_ok=target.ok,
+        params_valid=not param_errors,
+        current_total_bytes=current.total_bytes,
+        target_total_bytes=target.total_bytes,
+    )
+
+    def counts() -> dict:
+        return dict(
+            error_count=sum(1 for d in diagnostics if d.status == "error"),
+            warning_count=sum(1 for d in diagnostics if d.status == "warning"),
+        )
+
+    if not current.ok or not target.ok or param_errors:
+        return PlanFlashUpdateResponse(
+            ok=False,
+            operations=[],
+            blocks=[],
+            stats=None,
+            diagnostics=diagnostics,
+            **parse_fields,
+            **counts(),
+        )
+
+    for source, parsed in (("current", current), ("target", target)):
+        outside = count_outside(parsed.segments, params.flash_start, params.flash_end)
+        if outside:
+            diagnostics.append(
+                FlashDiagnosticOut(
+                    source=source,
+                    line=0,
+                    status="warning",
+                    message=(
+                        f"{outside} byte(s) outside flash window "
+                        f"[0x{params.flash_start:04X}, 0x{params.flash_end:04X}) ignored"
+                    ),
+                )
+            )
+
+    plan = plan_flash_update(current.segments, target.segments, params)
+    return PlanFlashUpdateResponse(
+        ok=True,
+        operations=[
+            FlashOperationOut(
+                op=o.op,
+                address=o.address,
+                size=o.size,
+                data_base64=base64.b64encode(o.data).decode("ascii") if o.data is not None else None,
+            )
+            for o in plan.operations
+        ],
+        blocks=[FlashBlockOut(**vars(b)) for b in plan.blocks],
+        stats=FlashStatsOut(
+            block_count=plan.block_count,
+            affected_blocks=len(plan.blocks),
+            erase_count=plan.erase_count,
+            erased_bytes=plan.erased_bytes,
+            write_count=plan.write_count,
+            written_bytes=plan.written_bytes,
+            changed_bytes=plan.changed_bytes,
+        ),
+        diagnostics=diagnostics,
+        **parse_fields,
+        **counts(),
     )
